@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use chrono::{DateTime, Utc};
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -51,8 +51,8 @@ struct AppState {
 }
 
 #[tauri::command]
-fn create_room(state: State<AppState>, app: AppHandle) -> Result<ServerResponse, String> {
-    let mut stream = TcpStream::connect("127.0.0.1:8080") // Replace with actual server address
+fn create_room(state: State<AppState>, _app: AppHandle) -> Result<ServerResponse, String> {
+    let mut stream = TcpStream::connect("127.0.0.1:8080")
         .map_err(|e| e.to_string())?;
     
     let request = ClientRequest::Create;
@@ -103,8 +103,9 @@ fn connect_room(
         .map_err(|e| e.to_string())?;
 
     if matches!(response, ServerResponse::Ok) {
+        let cloned_stream = stream.try_clone().map_err(|e| e.to_string())?;
         *state.stream.lock().unwrap() = Some(stream);
-        start_message_listener(stream.try_clone().map_err(|e| e.to_string())?, app);
+        start_message_listener(cloned_stream, app);
     }
 
     Ok(response)
@@ -179,21 +180,20 @@ fn start_message_listener(mut stream: TcpStream, app: AppHandle) {
             match stream.read(&mut buffer) {
                 Ok(n) if n > 0 => {
                     if let Ok(request) = serde_json::from_slice::<RoomRequest>(&buffer[..n]) {
-                        if let RoomRequest::Send { msg, addr, date } = request {
-                            let message = Message {
-                                id: date.timestamp().to_string(),
-                                content: msg,
-                                sender: "other",
-                                timestamp: date,
-                            };
-                            app.emit_all("new-message", message)
-                                .expect("Failed to emit message");
-                            
-                            let response = RoomResponse::Ok;
-                            let response_json = serde_json::to_string(&response).unwrap();
-                            stream.write_all(response_json.as_bytes()).unwrap();
-                            stream.flush().unwrap();
-                        }
+                        let RoomRequest::Send { msg, addr: _addr, date } = request;
+                        let message = Message {
+                            id: date.timestamp().to_string(),
+                            content: msg,
+                            sender: "other".to_string(),
+                            timestamp: date,
+                        };
+                        app.emit("new-message", message)
+                            .expect("Failed to emit message");
+                        
+                        let response = RoomResponse::Ok;
+                        let response_json = serde_json::to_string(&response).unwrap();
+                        stream.write_all(response_json.as_bytes()).unwrap();
+                        stream.flush().unwrap();
                     }
                 }
                 Ok(_) => break, // Connection closed

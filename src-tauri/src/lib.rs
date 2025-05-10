@@ -4,18 +4,19 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ClientRequest {
     #[serde(rename = "create")]
-    Create,
+    Create { id: String },
     #[serde(rename = "connect")]
-    Connect { addr: String },
+    Connect { id: String, addr: String },
     #[serde(rename = "disconnect")]
-    Disconnect,
+    Disconnect { id: String },
     #[serde(rename = "send")]
-    Send { msg: String, date: DateTime<Utc> },
+    Send { id: String, msg: String, date: DateTime<Utc> },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -33,7 +34,7 @@ pub enum ServerResponse {
 #[serde(tag = "type")]
 pub enum RoomRequest {
     #[serde(rename = "send")]
-    Send { msg: String, addr: String, date: DateTime<Utc> },
+    Send { id: String, msg: String, addr: String, date: DateTime<Utc> },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -48,14 +49,19 @@ pub enum RoomResponse {
 struct AppState {
     stream: Mutex<Option<TcpStream>>,
     room_addr: Mutex<Option<String>>,
+    client_id: Mutex<String>, // Добавляем хранение ID клиента
 }
 
 #[tauri::command]
 fn create_room(state: State<AppState>, _app: AppHandle) -> Result<ServerResponse, String> {
-    let mut stream = TcpStream::connect("127.0.0.1:8080")
+    let mut stream = TcpStream::connect("127.0.0.1:8000")
         .map_err(|e| e.to_string())?;
     
-    let request = ClientRequest::Create;
+    // Генерируем новый UUID для клиента
+    let client_id = Uuid::new_v4().to_string();
+    *state.client_id.lock().unwrap() = client_id.clone();
+    
+    let request = ClientRequest::Create { id: client_id };
     let request_json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
     stream
         .write_all(request_json.as_bytes())
@@ -89,8 +95,10 @@ fn connect_room(
         .unwrap()
         .take()
         .ok_or("No active connection")?;
+    
+    let client_id = state.client_id.lock().unwrap().clone();
 
-    let request = ClientRequest::Connect { addr };
+    let request = ClientRequest::Connect { id: client_id, addr };
     let request_json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
     stream
         .write_all(request_json.as_bytes())
@@ -119,8 +127,10 @@ fn disconnect_room(state: State<AppState>) -> Result<ServerResponse, String> {
         .unwrap()
         .take()
         .ok_or("No active connection")?;
+    
+    let client_id = state.client_id.lock().unwrap().clone();
 
-    let request = ClientRequest::Disconnect;
+    let request = ClientRequest::Disconnect { id: client_id };
     let request_json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
     stream
         .write_all(request_json.as_bytes())
@@ -154,8 +164,11 @@ fn send_message(
         .ok_or("No active connection")?
         .try_clone()
         .map_err(|e| e.to_string())?;
+    
+    let client_id = state.client_id.lock().unwrap().clone();
 
     let request = ClientRequest::Send {
+        id: client_id,
         msg,
         date: Utc::now(),
     };
@@ -180,11 +193,11 @@ fn start_message_listener(mut stream: TcpStream, app: AppHandle) {
             match stream.read(&mut buffer) {
                 Ok(n) if n > 0 => {
                     if let Ok(request) = serde_json::from_slice::<RoomRequest>(&buffer[..n]) {
-                        let RoomRequest::Send { msg, addr: _addr, date } = request;
+                        let RoomRequest::Send { id, msg, addr: _addr, date } = request;
                         let message = Message {
                             id: date.timestamp().to_string(),
                             content: msg,
-                            sender: "other".to_string(),
+                            sender: id, // Теперь используем переданный ID отправителя
                             timestamp: date,
                         };
                         app.emit("new-message", message)
@@ -216,6 +229,7 @@ pub fn run() {
         .manage(AppState {
             stream: Mutex::new(None),
             room_addr: Mutex::new(None),
+            client_id: Mutex::new(Uuid::new_v4().to_string()), // Инициализируем UUID при старте
         })
         .invoke_handler(tauri::generate_handler![
             create_room,
